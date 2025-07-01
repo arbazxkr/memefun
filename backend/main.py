@@ -1,14 +1,17 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlmodel import SQLModel, Field, Session, create_engine, select, desc
 from pydantic import BaseModel
 from typing import List, Optional
-import aiosqlite
-import asyncio
+from datetime import datetime, timedelta
 import random
-from datetime import datetime
-from fastapi.responses import JSONResponse
+import os
 
-app = FastAPI()
+DB_PATH = os.getenv("DB_PATH", "tokens.db")
+engine = create_engine(f"sqlite:///{DB_PATH}", echo=False)
+
+app = FastAPI(title="MemeFun API", description="Indian memecoin simulator like Pump.fun")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,150 +21,162 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB_PATH = "tokens.db"
+class Token(SQLModel):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    symbol: str
+    supply: int
+    image: Optional[str] = None
+    price: float = 1.0
+    market_cap: float = 0.0
+    holders: int = 1
+    volume: float = 0.0
+    launched_at: datetime = Field(default_factory=datetime.utcnow)
 
-class TokenIn(BaseModel):
+    class Config:
+        table = True
+
+class Trade(SQLModel):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    token_id: int = Field(foreign_key="token.id")
+    type: str
+    amount_inr: float
+    price: float
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+    class Config:
+        table = True
+
+class TokenCreate(BaseModel):
     name: str
     symbol: str
     supply: int
     image: Optional[str] = None
 
-class Token(TokenIn):
-    id: int
-    price: float
-    market_cap: float
-    holders: int
-    volume: float
-    launched_at: str
-
-class Trade(BaseModel):
-    token_id: int
-    amount: int
-
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('''CREATE TABLE IF NOT EXISTS tokens (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            symbol TEXT,
-            supply INTEGER,
-            image TEXT,
-            price REAL,
-            market_cap REAL,
-            holders INTEGER,
-            volume REAL,
-            launched_at TEXT
-        )''')
-        await db.execute('''CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            token_id INTEGER,
-            type TEXT,
-            amount INTEGER,
-            price REAL,
-            timestamp TEXT
-        )''')
-        await db.commit()
+class TradeRequest(BaseModel):
+    amount_inr: float
 
 @app.on_event("startup")
-async def startup():
-    await init_db()
+def on_startup():
+    SQLModel.metadata.create_all(engine)
 
 @app.post("/api/launch", response_model=Token)
-async def launch_token(token: TokenIn):
+def launch_token(token: TokenCreate):
     price = round(random.uniform(0.1, 10), 2)
     market_cap = price * token.supply
     holders = random.randint(1, 10)
     volume = round(random.uniform(100, 10000), 2)
-    launched_at = datetime.utcnow().isoformat() + 'Z'
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            """
-            INSERT INTO tokens (name, symbol, supply, image, price, market_cap, holders, volume, launched_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (token.name, token.symbol, token.supply, token.image, price, market_cap, holders, volume, launched_at)
-        )
-        await db.commit()
-        token_id = cursor.lastrowid
-    return Token(id=token_id, **token.dict(), price=price, market_cap=market_cap, holders=holders, volume=volume, launched_at=launched_at)
+    t = Token(
+        name=token.name,
+        symbol=token.symbol,
+        supply=token.supply,
+        image=token.image,
+        price=price,
+        market_cap=market_cap,
+        holders=holders,
+        volume=volume,
+        launched_at=datetime.utcnow(),
+    )
+    with Session(engine) as session:
+        session.add(t)
+        session.commit()
+        session.refresh(t)
+    return t
 
 @app.get("/api/tokens", response_model=List[Token])
-async def get_tokens():
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT * FROM tokens")
-        rows = await cursor.fetchall()
-        tokens = [Token(
-            id=row[0], name=row[1], symbol=row[2], supply=row[3], image=row[4],
-            price=row[5], market_cap=row[6], holders=row[7], volume=row[8], launched_at=row[9]
-        ) for row in rows]
+def get_tokens():
+    with Session(engine) as session:
+        tokens = session.exec(select(Token)).all()
     return tokens
 
 @app.get("/api/token/{id}", response_model=Token)
-async def get_token(id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT * FROM tokens WHERE id = ?", (id,))
-        row = await cursor.fetchone()
-        if not row:
+def get_token(id: int):
+    with Session(engine) as session:
+        token = session.get(Token, id)
+        if not token:
             raise HTTPException(status_code=404, detail="Token not found")
-        return Token(
-            id=row[0], name=row[1], symbol=row[2], supply=row[3], image=row[4],
-            price=row[5], market_cap=row[6], holders=row[7], volume=row[8], launched_at=row[9]
-        )
+    return token
 
-@app.post("/api/buy")
-async def buy_token(trade: Trade):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT price, holders, volume, supply FROM tokens WHERE id = ?", (trade.token_id,))
-        row = await cursor.fetchone()
-        if not row:
+@app.post("/api/token/{id}/buy")
+def buy_token(id: int, trade: TradeRequest):
+    with Session(engine) as session:
+        token = session.get(Token, id)
+        if not token:
             raise HTTPException(status_code=404, detail="Token not found")
-        price, holders, volume, supply = row
-        # Simulate price increase and volume
-        price = round(price * (1 + 0.01 * trade.amount), 4)
-        volume = round(volume + trade.amount * price, 2)
-        holders = holders + 1
-        await db.execute("UPDATE tokens SET price = ?, holders = ?, volume = ? WHERE id = ?", (price, holders, volume, trade.token_id))
-        await db.execute(
-            "INSERT INTO trades (token_id, type, amount, price, timestamp) VALUES (?, ?, ?, ?, ?)",
-            (trade.token_id, 'buy', trade.amount, price, datetime.utcnow().isoformat() + 'Z')
-        )
-        await db.commit()
-    return {"success": True, "new_price": price, "volume": volume, "holders": holders}
+        # Pricing logic
+        factor = 0.02
+        price_increase = trade.amount_inr / token.supply * factor
+        token.price = round(token.price + price_increase, 4)
+        token.volume += trade.amount_inr
+        token.holders += 1
+        token.market_cap = token.price * token.supply
+        session.add(token)
+        session.add(Trade(token_id=id, type="buy", amount_inr=trade.amount_inr, price=token.price))
+        session.commit()
+        session.refresh(token)
+    return {"success": True, "new_price": token.price, "volume": token.volume, "holders": token.holders}
 
-@app.post("/api/sell")
-async def sell_token(trade: Trade):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT price, holders, volume FROM tokens WHERE id = ?", (trade.token_id,))
-        row = await cursor.fetchone()
-        if not row:
+@app.post("/api/token/{id}/sell")
+def sell_token(id: int, trade: TradeRequest):
+    with Session(engine) as session:
+        token = session.get(Token, id)
+        if not token:
             raise HTTPException(status_code=404, detail="Token not found")
-        price, holders, volume = row
-        # Simulate price decrease and volume
-        price = round(max(price * (1 - 0.01 * trade.amount), 0.01), 4)
-        volume = round(max(volume - trade.amount * price, 0), 2)
-        holders = max(holders - 1, 1)
-        await db.execute("UPDATE tokens SET price = ?, holders = ?, volume = ? WHERE id = ?", (price, holders, volume, trade.token_id))
-        await db.execute(
-            "INSERT INTO trades (token_id, type, amount, price, timestamp) VALUES (?, ?, ?, ?, ?)",
-            (trade.token_id, 'sell', trade.amount, price, datetime.utcnow().isoformat() + 'Z')
-        )
-        await db.commit()
-    return {"success": True, "new_price": price, "volume": volume, "holders": holders}
+        factor = 0.02
+        price_decrease = trade.amount_inr / token.supply * factor
+        token.price = round(max(token.price - price_decrease, 0.01), 4)
+        token.volume = max(token.volume - trade.amount_inr, 0)
+        token.holders = max(token.holders - 1, 1)
+        token.market_cap = token.price * token.supply
+        session.add(token)
+        session.add(Trade(token_id=id, type="sell", amount_inr=trade.amount_inr, price=token.price))
+        session.commit()
+        session.refresh(token)
+    return {"success": True, "new_price": token.price, "volume": token.volume, "holders": token.holders}
 
-@app.get("/api/trustscore/{id}")
-async def get_trust_score(id: int):
-    # Simulate trust score
-    return {"id": id, "trust_score": random.randint(0, 100)}
+@app.get("/api/token/{id}/chart")
+def get_chart(id: int):
+    # Return mock OHLC price history for chart
+    with Session(engine) as session:
+        trades = session.exec(select(Trade).where(Trade.token_id == id).order_by(desc(Trade.timestamp)).all())
+        if not trades:
+            return []
+        # Generate OHLC from trades (mocked)
+        ohlc = []
+        for t in trades:
+            ohlc.append({
+                "timestamp": t.timestamp.isoformat(),
+                "open": t.price,
+                "high": t.price + random.uniform(0, 1),
+                "low": max(t.price - random.uniform(0, 1), 0.01),
+                "close": t.price
+            })
+    return ohlc
 
-@app.get("/api/trades/{token_id}")
-async def get_trades(token_id: int, limit: int = 20):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT type, amount, price, timestamp FROM trades WHERE token_id = ? ORDER BY timestamp DESC LIMIT ?",
-            (token_id, limit)
-        )
-        rows = await cursor.fetchall()
-        trades = [
-            {"type": row[0], "amount": row[1], "price": row[2], "timestamp": row[3]} for row in rows
+@app.get("/api/token/{id}/trustscore")
+def get_trustscore(id: int):
+    # Mock trust score: random or rule-based
+    with Session(engine) as session:
+        token = session.get(Token, id)
+        if not token:
+            raise HTTPException(status_code=404, detail="Token not found")
+        # Example: higher price and volume = higher trust
+        score = min(100, int(token.price * 10 + token.volume / 1000))
+    return {"id": id, "trust_score": score}
+
+@app.get("/api/token/{id}/trades")
+def get_trades(id: int, limit: int = 20):
+    with Session(engine) as session:
+        trades = session.exec(select(Trade).where(Trade.token_id == id).order_by(desc(Trade.timestamp)).limit(limit)).all()
+        return [
+            {"type": t.type, "amount_inr": t.amount_inr, "price": t.price, "timestamp": t.timestamp.isoformat()} for t in trades
         ]
-    return JSONResponse(content=trades) 
+
+@app.get("/api/leaderboard")
+def leaderboard(sort_by: str = "volume"):
+    with Session(engine) as session:
+        if sort_by == "market_cap":
+            tokens = session.exec(select(Token).order_by(desc(Token.market_cap))).all()
+        else:
+            tokens = session.exec(select(Token).order_by(desc(Token.volume))).all()
+    return tokens 
